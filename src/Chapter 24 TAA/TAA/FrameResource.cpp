@@ -10,6 +10,7 @@ FrameResource::FrameResource(ID3D12Device* device, UINT passCount, UINT objectCo
     MaterialBuffer = std::make_unique<UploadBuffer<MaterialData>>(device, materialCount, false);
     ObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(device, objectCount, true);
     TAACB = std::make_unique<UploadBuffer<TAAConstants>>(device, 1, true);
+    BlurCB = std::make_unique<UploadBuffer<BlurConstants>>(device, 2, true);  // 2 passes: horizontal + vertical
 }
 
 FrameResource::~FrameResource()

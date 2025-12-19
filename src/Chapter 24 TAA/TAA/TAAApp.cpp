@@ -10,6 +10,8 @@
 #include "FrameResource.h"
 #include "TemporalAA.h"
 #include "MotionVectors.h"
+#include "SilhouetteBlur.h"
+#include "FSRUpscaler.h"
 
 
 
@@ -107,6 +109,8 @@ private:
     void DrawSceneToTexture();
     void DrawMotionVectors();
     void ResolveTAA();
+    void ApplySilhouetteBlur();
+    void UpdateBlurCB(const GameTimer& gt);
 
     std::array<const CD3DX12_STATIC_SAMPLER_DESC, 7> GetStaticSamplers();
 
@@ -117,6 +121,7 @@ private:
 
     ComPtr<ID3D12RootSignature> mRootSignature = nullptr;
     ComPtr<ID3D12RootSignature> mTAARootSignature = nullptr;
+    ComPtr<ID3D12RootSignature> mBlurRootSignature = nullptr;
 
     ComPtr<ID3D12DescriptorHeap> mSrvDescriptorHeap = nullptr;
 
@@ -138,6 +143,7 @@ private:
     
     std::unique_ptr<TemporalAA> mTemporalAA;
     std::unique_ptr<MotionVectors> mMotionVectors;
+    std::unique_ptr<SilhouetteBlur> mSilhouetteBlur;
     
     ComPtr<ID3D12Resource> mSceneColorBuffer;
     ComPtr<ID3D12Resource> mSceneDepthBuffer;
@@ -151,9 +157,24 @@ private:
     UINT mTAAHistorySrvIndex = 0;
     UINT mTAAHistoryRtvIndex = 0;
     UINT mSceneDepthSrvIndex = 0;
+    UINT mBlurPass1InputSrvIndex = 0;
+    UINT mBlurIntermediateSrvIndex = 0;
+    UINT mBlurIntermediateRtvIndex = 0;
+    UINT mBlurOutputSrvIndex = 0;
+    UINT mBlurOutputRtvIndex = 0;
 
     int mFrameIndex = 0;
+    bool mBlurEnabled = true;
+    float mBlurRadius = 2.0f;
+    float mVelocityThreshold = 0.5f;
     bool mTAAEnabled = true;
+    
+    // FSR members
+    std::unique_ptr<FSRUpscaler> mFSRUpscaler;
+    ComPtr<ID3D12Resource> mFSROutputBuffer;
+    UINT mFSROutputUavIndex = 0;
+    bool mFSREnabled = false;
+    bool mFSRNeedsReset = true;
     
     POINT mLastMousePos;
 };
@@ -194,8 +215,11 @@ TAAApp::~TAAApp()
         FlushCommandQueue();
     
     // Освобождаем ресурсы
+    mFSRUpscaler.reset();
+    mFSROutputBuffer.Reset();
     mTemporalAA.reset();
     mMotionVectors.reset();
+    mSilhouetteBlur.reset();
     mSceneColorBuffer.Reset();
     mSceneDepthBuffer.Reset();
 }
@@ -230,9 +254,9 @@ bool TAAApp::Initialize()
 
 void TAAApp::CreateRtvAndDsvDescriptorHeaps()
 {
-    // Need RTVs for: swap chain buffers + scene color + motion vectors + TAA output + TAA history + FSR intermediate
+    // Need RTVs for: swap chain buffers + scene color + motion vectors + TAA output + TAA history + blur intermediate + blur output
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc;
-    rtvHeapDesc.NumDescriptors = SwapChainBufferCount + 6;
+    rtvHeapDesc.NumDescriptors = SwapChainBufferCount + 8;
     rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     rtvHeapDesc.NodeMask = 0;
@@ -258,7 +282,7 @@ void TAAApp::OnResize()
     if(mSrvDescriptorHeap == nullptr)
     {
         D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-        srvHeapDesc.NumDescriptors = 12; // Extra for FSR
+        srvHeapDesc.NumDescriptors = 16; // Extra for blur buffers
         srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&mSrvDescriptorHeap)));
@@ -269,6 +293,9 @@ void TAAApp::OnResize()
     {
         mTemporalAA->OnResize(mClientWidth, mClientHeight);
         mMotionVectors->OnResize(mClientWidth, mClientHeight);
+        mSilhouetteBlur->OnResize(mClientWidth, mClientHeight);
+        if(mFSRUpscaler != nullptr)
+            mFSRUpscaler->OnResize(mClientWidth, mClientHeight);
     }
     else
     {
@@ -276,6 +303,37 @@ void TAAApp::OnResize()
             md3dDevice.Get(), mClientWidth, mClientHeight, mBackBufferFormat);
         mMotionVectors = std::make_unique<MotionVectors>(
             md3dDevice.Get(), mClientWidth, mClientHeight);
+        mSilhouetteBlur = std::make_unique<SilhouetteBlur>(
+            md3dDevice.Get(), mClientWidth, mClientHeight, mBackBufferFormat);
+        
+        // Initialize FSR
+        mFSRUpscaler = std::make_unique<FSRUpscaler>();
+        mFSRUpscaler->Initialize(md3dDevice.Get(), mClientWidth, mClientHeight, 
+                                  FSRUpscaler::QualityMode::Quality);
+    }
+    
+    // Create FSR output buffer (UAV for compute shader output)
+    {
+        D3D12_RESOURCE_DESC fsrOutputDesc = {};
+        fsrOutputDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        fsrOutputDesc.Width = mClientWidth;
+        fsrOutputDesc.Height = mClientHeight;
+        fsrOutputDesc.DepthOrArraySize = 1;
+        fsrOutputDesc.MipLevels = 1;
+        fsrOutputDesc.Format = mBackBufferFormat;
+        fsrOutputDesc.SampleDesc.Count = 1;
+        fsrOutputDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        fsrOutputDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        ThrowIfFailed(md3dDevice->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+            D3D12_HEAP_FLAG_NONE,
+            &fsrOutputDesc,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            IID_PPV_ARGS(&mFSROutputBuffer)));
+        
+        mFSROutputBuffer->SetName(L"FSR Output Buffer");
     }
 
     // Build scene color buffer
@@ -406,6 +464,49 @@ void TAAApp::OnResize()
     rtvHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(mRtvHeap->GetCPUDescriptorHandleForHeapStart());
     rtvHandle.Offset(mTAAHistoryRtvIndex, mRtvDescriptorSize);
     md3dDevice->CreateRenderTargetView(mTemporalAA->HistoryResource(), nullptr, rtvHandle);
+    
+    // Silhouette Blur buffers
+    // Layout: [8] = TAA output copy for blur, [9] = motion vectors copy for blur pass 1
+    //         [10] = blur intermediate, [11] = motion vectors copy for blur pass 2
+    mBlurPass1InputSrvIndex = 8;  // TAA output + motion vectors (consecutive)
+    mBlurIntermediateSrvIndex = 10;  // Blur intermediate + motion vectors (consecutive)
+    mBlurOutputSrvIndex = 12;
+    mBlurIntermediateRtvIndex = SwapChainBufferCount + 4;
+    mBlurOutputRtvIndex = SwapChainBufferCount + 5;
+    
+    // Create SRVs for blur pass 1 input: TAA output (t0) + motion vectors (t1)
+    srvCpuHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+    srvCpuHandle.Offset(mBlurPass1InputSrvIndex, mCbvSrvUavDescriptorSize);
+    srvDesc.Format = mBackBufferFormat;
+    md3dDevice->CreateShaderResourceView(mTemporalAA->Resource(), &srvDesc, srvCpuHandle);
+    
+    srvCpuHandle.Offset(1, mCbvSrvUavDescriptorSize);
+    srvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    md3dDevice->CreateShaderResourceView(mMotionVectors->Resource(), &srvDesc, srvCpuHandle);
+    
+    // Create SRVs for blur pass 2 input: blur intermediate (t0) + motion vectors (t1)
+    srvCpuHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+    srvCpuHandle.Offset(mBlurIntermediateSrvIndex, mCbvSrvUavDescriptorSize);
+    srvDesc.Format = mBackBufferFormat;
+    md3dDevice->CreateShaderResourceView(mSilhouetteBlur->IntermediateResource(), &srvDesc, srvCpuHandle);
+    
+    srvCpuHandle.Offset(1, mCbvSrvUavDescriptorSize);
+    srvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    md3dDevice->CreateShaderResourceView(mMotionVectors->Resource(), &srvDesc, srvCpuHandle);
+    
+    // Create SRV for blur output
+    srvCpuHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+    srvCpuHandle.Offset(mBlurOutputSrvIndex, mCbvSrvUavDescriptorSize);
+    srvDesc.Format = mBackBufferFormat;
+    md3dDevice->CreateShaderResourceView(mSilhouetteBlur->OutputResource(), &srvDesc, srvCpuHandle);
+    
+    // Create RTVs for blur buffers
+    rtvHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(mRtvHeap->GetCPUDescriptorHandleForHeapStart());
+    rtvHandle.Offset(mBlurIntermediateRtvIndex, mRtvDescriptorSize);
+    md3dDevice->CreateRenderTargetView(mSilhouetteBlur->IntermediateResource(), nullptr, rtvHandle);
+    
+    rtvHandle.Offset(1, mRtvDescriptorSize);
+    md3dDevice->CreateRenderTargetView(mSilhouetteBlur->OutputResource(), nullptr, rtvHandle);
 }
 
 void TAAApp::Update(const GameTimer& gt)
@@ -430,6 +531,7 @@ void TAAApp::Update(const GameTimer& gt)
     UpdateMainPassCB(gt);
     UpdateMotionVectorPassCB(gt);
     UpdateTAACB(gt);
+    UpdateBlurCB(gt);
     
     mFrameIndex++;
 }
@@ -453,7 +555,7 @@ void TAAApp::Draw(const GameTimer& gt)
     // 2. Generate motion vectors
     DrawMotionVectors();
 
-    // 3. Apply TAA or FSR3
+    // 3. Apply TAA
     if(mTAAEnabled)
     {
         // First frame: initialize history buffer with current frame
@@ -484,29 +586,145 @@ void TAAApp::Draw(const GameTimer& gt)
         
         ResolveTAA();
         
-        // Copy TAA output to back buffer
+        // Transition TAA output for next stage
         mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
             mTemporalAA->Resource(),
             D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_COPY_SOURCE));
+            D3D12_RESOURCE_STATE_GENERIC_READ));
         
-        mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
-            CurrentBackBuffer(),
-            D3D12_RESOURCE_STATE_PRESENT,
-            D3D12_RESOURCE_STATE_COPY_DEST));
+        // Determine which buffer to use for final output (TAA output or blur output)
+        ID3D12Resource* finalColorBuffer = mTemporalAA->Resource();
+        
+        // Apply silhouette blur (blurs static pixels)
+        if (mBlurEnabled)
+        {
+            ApplySilhouetteBlur();
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                mSilhouetteBlur->OutputResource(),
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_GENERIC_READ));
+            
+            finalColorBuffer = mSilhouetteBlur->OutputResource();
+        }
+        
+        // 4. Apply FSR upscaling if enabled (after TAA + blur)
+        if (mFSREnabled && mFSRUpscaler && mFSRUpscaler->IsInitialized())
+        {
+            // Transition resources for FSR
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                finalColorBuffer,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                mSceneDepthBuffer.Get(),
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                mMotionVectors->Resource(),
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                mFSROutputBuffer.Get(),
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            
+            // FSR is used as post-TAA upscaler, so no jitter needed
+            // (TAA already resolved the jittered input)
+            
+            // Dispatch FSR
+            mFSRUpscaler->Dispatch(
+                mCommandList.Get(),
+                finalColorBuffer,
+                mSceneDepthBuffer.Get(),
+                mMotionVectors->Resource(),
+                mFSROutputBuffer.Get(),
+                gt.DeltaTime() * 1000.0f,
+                mCamera.GetNearZ(),
+                mCamera.GetFarZ(),
+                0.25f * MathHelper::Pi,
+                mFSRNeedsReset);
+            
+            mFSRNeedsReset = false;
+            
+            // Copy FSR output to back buffer
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                mFSROutputBuffer.Get(),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE));
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                CurrentBackBuffer(),
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST));
+            
+            mCommandList->CopyResource(CurrentBackBuffer(), mFSROutputBuffer.Get());
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                CurrentBackBuffer(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT));
+            
+            // Restore resource states
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                mFSROutputBuffer.Get(),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON));
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                finalColorBuffer,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_GENERIC_READ));
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                mSceneDepthBuffer.Get(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_GENERIC_READ));
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                mMotionVectors->Resource(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_GENERIC_READ));
+        }
+        else
+        {
+            // No FSR - copy TAA/blur output directly to back buffer
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                finalColorBuffer,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                D3D12_RESOURCE_STATE_COPY_SOURCE));
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                CurrentBackBuffer(),
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST));
 
-        mCommandList->CopyResource(CurrentBackBuffer(), mTemporalAA->Resource());
-
-        mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
-            CurrentBackBuffer(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_PRESENT));
+            mCommandList->CopyResource(CurrentBackBuffer(), finalColorBuffer);
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                finalColorBuffer,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_GENERIC_READ));
+            
+            mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+                CurrentBackBuffer(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT));
+        }
         
         // Copy TAA output to history buffer for next frame
         mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
             mTemporalAA->HistoryResource(),
             D3D12_RESOURCE_STATE_GENERIC_READ,
             D3D12_RESOURCE_STATE_COPY_DEST));
+        
+        mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+            mTemporalAA->Resource(),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            D3D12_RESOURCE_STATE_COPY_SOURCE));
 
         mCommandList->CopyResource(mTemporalAA->HistoryResource(), mTemporalAA->Resource());
 
@@ -522,7 +740,7 @@ void TAAApp::Draw(const GameTimer& gt)
     }
     else
     {
-        // No AA - copy scene color directly to back buffer
+        // No TAA - copy scene color directly to back buffer
         mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
             mSceneColorBuffer.Get(),
             D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -741,6 +959,97 @@ void TAAApp::OnKeyboardInput(const GameTimer& gt)
     {
         tKeyPressed = false;
     }
+    
+    // Toggle Blur with B key
+    static bool bKeyPressed = false;
+    if(GetAsyncKeyState('B') & 0x8000)
+    {
+        if(!bKeyPressed)
+        {
+            mBlurEnabled = !mBlurEnabled;
+            OutputDebugStringA(mBlurEnabled ? "Silhouette Blur: ON\n" : "Silhouette Blur: OFF\n");
+            bKeyPressed = true;
+        }
+    }
+    else
+    {
+        bKeyPressed = false;
+    }
+    
+    // Toggle FSR with F key
+    static bool fKeyPressed = false;
+    if(GetAsyncKeyState('F') & 0x8000)
+    {
+        if(!fKeyPressed)
+        {
+            mFSREnabled = !mFSREnabled;
+            mFSRNeedsReset = true;  // Reset temporal history when toggling
+            if (mFSREnabled && mFSRUpscaler)
+            {
+                char msg[128];
+                sprintf_s(msg, "FSR Sharpening: ON (sharpness=%.1f)\n", mFSRUpscaler->GetSharpness());
+                OutputDebugStringA(msg);
+            }
+            else
+            {
+                OutputDebugStringA("FSR Sharpening: OFF\n");
+            }
+            fKeyPressed = true;
+        }
+    }
+    else
+    {
+        fKeyPressed = false;
+    }
+    
+    // Adjust FSR sharpness with [ and ] keys
+    if (mFSRUpscaler && mFSREnabled)
+    {
+        static bool bracketLeftPressed = false;
+        static bool bracketRightPressed = false;
+        
+        if(GetAsyncKeyState(VK_OEM_4) & 0x8000)  // [ key
+        {
+            if(!bracketLeftPressed)
+            {
+                float newSharpness = mFSRUpscaler->GetSharpness() - 0.1f;
+                if (newSharpness < 0.0f) newSharpness = 0.0f;
+                mFSRUpscaler->SetSharpness(newSharpness);
+                char msg[64];
+                sprintf_s(msg, "FSR Sharpness: %.1f\n", newSharpness);
+                OutputDebugStringA(msg);
+                bracketLeftPressed = true;
+            }
+        }
+        else
+        {
+            bracketLeftPressed = false;
+        }
+        
+        if(GetAsyncKeyState(VK_OEM_6) & 0x8000)  // ] key
+        {
+            if(!bracketRightPressed)
+            {
+                float newSharpness = mFSRUpscaler->GetSharpness() + 0.1f;
+                if (newSharpness > 1.0f) newSharpness = 1.0f;
+                mFSRUpscaler->SetSharpness(newSharpness);
+                char msg[64];
+                sprintf_s(msg, "FSR Sharpness: %.1f\n", newSharpness);
+                OutputDebugStringA(msg);
+                bracketRightPressed = true;
+            }
+        }
+        else
+        {
+            bracketRightPressed = false;
+        }
+    }
+    
+    // Adjust blur radius with +/- keys
+    if(GetAsyncKeyState(VK_OEM_PLUS) & 0x8000)
+        mBlurRadius = min(mBlurRadius + 0.1f, 5.0f);
+    if(GetAsyncKeyState(VK_OEM_MINUS) & 0x8000)
+        mBlurRadius = max(mBlurRadius - 0.1f, 0.5f);
 
     mCamera.UpdateViewMatrix();
 }
@@ -903,6 +1212,85 @@ void TAAApp::UpdateTAACB(const GameTimer& gt)
     currTAACB->CopyData(0, mTAACB);
 }
 
+void TAAApp::UpdateBlurCB(const GameTimer& gt)
+{
+    BlurConstants blurCB;
+    blurCB.ScreenSize = XMFLOAT2((float)mClientWidth, (float)mClientHeight);
+    blurCB.VelocityThreshold = mVelocityThreshold;
+    blurCB.BlurRadius = mBlurRadius;
+    
+    // Horizontal pass
+    blurCB.BlurDirection = XMFLOAT2(1.0f, 0.0f);
+    mCurrFrameResource->BlurCB->CopyData(0, blurCB);
+    
+    // Vertical pass
+    blurCB.BlurDirection = XMFLOAT2(0.0f, 1.0f);
+    mCurrFrameResource->BlurCB->CopyData(1, blurCB);
+}
+
+void TAAApp::ApplySilhouetteBlur()
+{
+    mCommandList->SetPipelineState(mPSOs["blur"].Get());
+    mCommandList->SetGraphicsRootSignature(mBlurRootSignature.Get());
+    
+    // === Pass 1: Horizontal blur ===
+    // Input: TAA output + motion vectors, Output: Blur intermediate
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mSilhouetteBlur->IntermediateResource(),
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_RENDER_TARGET));
+    
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(mRtvHeap->GetCPUDescriptorHandleForHeapStart());
+    rtvHandle.Offset(mBlurIntermediateRtvIndex, mRtvDescriptorSize);
+    mCommandList->OMSetRenderTargets(1, &rtvHandle, true, nullptr);
+    
+    // Bind horizontal blur constants
+    auto blurCB = mCurrFrameResource->BlurCB->Resource();
+    mCommandList->SetGraphicsRootConstantBufferView(0, blurCB->GetGPUVirtualAddress());
+    
+    // Bind TAA output (t0) and motion vectors (t1) - consecutive in heap at mBlurPass1InputSrvIndex
+    CD3DX12_GPU_DESCRIPTOR_HANDLE srvHandle(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+    srvHandle.Offset(mBlurPass1InputSrvIndex, mCbvSrvUavDescriptorSize);
+    mCommandList->SetGraphicsRootDescriptorTable(1, srvHandle);
+    
+    // Draw full-screen triangle
+    mCommandList->IASetVertexBuffers(0, 0, nullptr);
+    mCommandList->IASetIndexBuffer(nullptr);
+    mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    mCommandList->DrawInstanced(3, 1, 0, 0);
+    
+    // Transition intermediate to read
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mSilhouetteBlur->IntermediateResource(),
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_GENERIC_READ));
+    
+    // === Pass 2: Vertical blur ===
+    // Input: Blur intermediate + motion vectors, Output: Blur output
+    mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+        mSilhouetteBlur->OutputResource(),
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_RENDER_TARGET));
+    
+    rtvHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(mRtvHeap->GetCPUDescriptorHandleForHeapStart());
+    rtvHandle.Offset(mBlurOutputRtvIndex, mRtvDescriptorSize);
+    mCommandList->OMSetRenderTargets(1, &rtvHandle, true, nullptr);
+    
+    // Bind vertical blur constants (second entry in BlurCB)
+    UINT blurCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(BlurConstants));
+    mCommandList->SetGraphicsRootConstantBufferView(0, blurCB->GetGPUVirtualAddress() + blurCBByteSize);
+    
+    // Bind intermediate buffer (t0) and motion vectors (t1) - consecutive in heap at mBlurIntermediateSrvIndex
+    srvHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+    srvHandle.Offset(mBlurIntermediateSrvIndex, mCbvSrvUavDescriptorSize);
+    mCommandList->SetGraphicsRootDescriptorTable(1, srvHandle);
+    
+    // Draw full-screen triangle
+    mCommandList->DrawInstanced(3, 1, 0, 0);
+    
+    // Note: Output stays in RENDER_TARGET state, will be transitioned in Draw()
+}
+
 void TAAApp::LoadTextures()
 {
     // Create a simple white texture
@@ -1018,6 +1406,34 @@ void TAAApp::BuildRootSignature()
         taaSerializedRootSig->GetBufferPointer(),
         taaSerializedRootSig->GetBufferSize(),
         IID_PPV_ARGS(mTAARootSignature.GetAddressOf())));
+    
+    // Blur root signature
+    CD3DX12_DESCRIPTOR_RANGE blurTexTable;
+    blurTexTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0); // input texture, motion vectors
+
+    CD3DX12_ROOT_PARAMETER blurRootParameter[2];
+    blurRootParameter[0].InitAsConstantBufferView(0);
+    blurRootParameter[1].InitAsDescriptorTable(1, &blurTexTable, D3D12_SHADER_VISIBILITY_PIXEL);
+
+    CD3DX12_ROOT_SIGNATURE_DESC blurRootSigDesc(2, blurRootParameter,
+        (UINT)staticSamplers.size(), staticSamplers.data(),
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+    ComPtr<ID3DBlob> blurSerializedRootSig = nullptr;
+    hr = D3D12SerializeRootSignature(&blurRootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+        blurSerializedRootSig.GetAddressOf(), errorBlob.GetAddressOf());
+
+    if(errorBlob != nullptr)
+    {
+        ::OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+    }
+    ThrowIfFailed(hr);
+
+    ThrowIfFailed(md3dDevice->CreateRootSignature(
+        0,
+        blurSerializedRootSig->GetBufferPointer(),
+        blurSerializedRootSig->GetBufferSize(),
+        IID_PPV_ARGS(mBlurRootSignature.GetAddressOf())));
 }
 
 void TAAApp::BuildDescriptorHeaps()
@@ -1059,6 +1475,9 @@ void TAAApp::BuildShadersAndInputLayout()
     
     mShaders["taaResolveVS"] = d3dUtil::CompileShader(L"Shaders\\TAAResolve.hlsl", nullptr, "VS", "vs_5_1");
     mShaders["taaResolvePS"] = d3dUtil::CompileShader(L"Shaders\\TAAResolve.hlsl", nullptr, "PS", "ps_5_1");
+    
+    mShaders["blurVS"] = d3dUtil::CompileShader(L"Shaders\\SilhouetteBlur.hlsl", nullptr, "VS", "vs_5_1");
+    mShaders["blurPS"] = d3dUtil::CompileShader(L"Shaders\\SilhouetteBlur.hlsl", nullptr, "PS", "ps_5_1");
 
     mInputLayout =
     {
@@ -1244,6 +1663,21 @@ void TAAApp::BuildPSOs()
     taaResolvePsoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;
     taaResolvePsoDesc.DepthStencilState.DepthEnable = FALSE;
     ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&taaResolvePsoDesc, IID_PPV_ARGS(&mPSOs["taaResolve"])));
+    
+    // Silhouette blur PSO (full-screen pass)
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC blurPsoDesc = taaResolvePsoDesc;
+    blurPsoDesc.pRootSignature = mBlurRootSignature.Get();
+    blurPsoDesc.VS =
+    {
+        reinterpret_cast<BYTE*>(mShaders["blurVS"]->GetBufferPointer()),
+        mShaders["blurVS"]->GetBufferSize()
+    };
+    blurPsoDesc.PS =
+    {
+        reinterpret_cast<BYTE*>(mShaders["blurPS"]->GetBufferPointer()),
+        mShaders["blurPS"]->GetBufferSize()
+    };
+    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&blurPsoDesc, IID_PPV_ARGS(&mPSOs["blur"])));
 }
 
 void TAAApp::BuildFrameResources()

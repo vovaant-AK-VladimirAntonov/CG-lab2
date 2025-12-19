@@ -49,6 +49,15 @@ struct TAAConstants
     DirectX::XMFLOAT2 Padding = { 0.0f, 0.0f };
 };
 
+struct BlurConstants
+{
+    DirectX::XMFLOAT2 ScreenSize = { 0.0f, 0.0f };
+    DirectX::XMFLOAT2 BlurDirection = { 1.0f, 0.0f };  // (1,0) horizontal, (0,1) vertical
+    float VelocityThreshold = 0.5f;  // Pixels - below this is considered static
+    float BlurRadius = 1.0f;         // Blur strength multiplier
+    DirectX::XMFLOAT2 Padding = { 0.0f, 0.0f };
+};
+
 struct MaterialData
 {
     DirectX::XMFLOAT4 DiffuseAlbedo = { 1.0f, 1.0f, 1.0f, 1.0f };
@@ -85,6 +94,7 @@ public:
     std::unique_ptr<UploadBuffer<ObjectConstants>> ObjectCB = nullptr;
     std::unique_ptr<UploadBuffer<MaterialData>> MaterialBuffer = nullptr;
     std::unique_ptr<UploadBuffer<TAAConstants>> TAACB = nullptr;
+    std::unique_ptr<UploadBuffer<BlurConstants>> BlurCB = nullptr;
 
     UINT64 Fence = 0;
 };
